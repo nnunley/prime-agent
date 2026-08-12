@@ -1,10 +1,14 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getProcessStartId } from "../../../src/core/session-lease.js";
-import { acquireDaemonSupervisorOwnership } from "../../../src/modes/daemon/daemon-supervisor-ownership.js";
+import {
+	acquireDaemonSupervisorOwnership,
+	assertDaemonSupervisorOwnerCurrent,
+} from "../../../src/modes/daemon/daemon-supervisor-ownership.js";
 
 // EXHAUSTIVE DECISION-TABLE PROOF for #1291 / #1148.
 //
@@ -27,6 +31,24 @@ import { acquireDaemonSupervisorOwnership } from "../../../src/modes/daemon/daem
 // machinery that already exists in this same file (isProcessAlive /
 // isProcessIdentityAlive), so a destroyed record under a healthy owner and a
 // genuine takeover by a live rival are indistinguishable at the call site.
+//
+// REACHABILITY (added after review): the fact space is enumerated in full, but
+// not every point of it is reachable in production, and the artifact must not
+// overstate the defect. acquireDaemonSupervisorOwnership mints the record in
+// the CURRENT process - `pid: process.pid` (:316) and
+// `processStartId: getProcessStartId(process.pid)` (:309) - and assertCurrent
+// compares that frozen record against the file. A process executing
+// assertCurrent is therefore alive by construction and its own start id cannot
+// change while it holds the pid, so every own-identity-dead or own-start-id-
+// mismatched shape below exists only because this harness assigns those fields.
+// Likewise assertCurrent reads ownerDirectoryPath(registryDir,
+// this.record.generation) (:602-607), and each supervisor instance mints its own
+// generation UUID (daemon-supervisor.ts:605), writes atomically
+// (writeJsonAtomically, :710-712) and mutates only under a token check
+// (:291-299) - so no in-repo writer can leave a VALID record with DIFFERENT
+// compared fields at our own generation path. Every case carries a reachability
+// label and the report splits on it. The reachable divergences are exactly the
+// absent/unparseable/wrong-shape collapse under a live owner.
 //
 // SAFETY: every case builds its own mkdtemp registry, exports it through
 // PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR for the duration of the
@@ -68,49 +90,28 @@ interface Facts {
 type Verdict = "recoverable" | "fatal";
 
 /**
- * Can this fact-shape occur in the shipped product, or only in a harness?
- *
- * `DaemonSupervisorOwnership` is constructed in exactly ONE place -
- * daemon-supervisor-ownership.ts:362, at the end of
- * acquireDaemonSupervisorOwnership - and that function mints the record in the
- * CURRENT process: `pid: process.pid` (:316) and
- * `processStartId: getProcessStartId(process.pid)` (:309), spread conditionally
- * at :317 so the field is OMITTED when the start id is unobservable. Its only
- * caller is daemon-supervisor.ts:892.
- *
- * Therefore, for assertCurrent, the OWN side of the fact space is not free:
- * the process executing assertCurrent is by construction the process named in
- * `this.record`. Its own liveness is vacuously true, and its own start id
- * either equals the one observed for that pid at mint time or is absent.
- * The harness can only reach `pidLiveness="dead"` or
- * `startIdAgreement="mismatches"` by assigning over `ownership.record` after
- * the fact, which no production path does.
- *
- * The FILE side is fully free in production: the bytes at owner.json are
- * written by other processes, by a reaper, or by a torn write.
+ * Whether a fact-shape can occur in production, or exists only because the
+ * harness manufactured it. Enumeration is unaffected; the report splits on it.
  */
-type Reachability = "reachable" | "unreachable-by-construction";
+type Reachability = "reachable" | "unreachable-own-identity-minted" | "unreachable-generation-scoped-path";
 
-function reachabilityOf(facts: Facts): { reachability: Reachability; reason: string } {
-	if (facts.pidLiveness === "dead") {
-		return {
-			reachability: "unreachable-by-construction",
-			reason: "own pid is dead, but daemon-supervisor-ownership.ts:316 mints pid=process.pid and :362 is the sole construction site, so the process running assertCurrent IS the recorded pid (:308-317)",
-		};
+function reachability(facts: Facts): Reachability {
+	// acquireDaemonSupervisorOwnership sets pid: process.pid (:316) and
+	// processStartId: getProcessStartId(process.pid) (:309), and nothing in the
+	// repo rewrites them afterwards. The process running assertCurrent is
+	// therefore alive with a matching (or unobservable) start id, always.
+	if (facts.pidLiveness === "dead" || facts.startIdAgreement === "mismatches") {
+		return "unreachable-own-identity-minted";
 	}
-	if (facts.startIdAgreement === "mismatches") {
-		return {
-			reachability: "unreachable-by-construction",
-			reason: "own processStartId contradicts the live process, but :309 records getProcessStartId(process.pid) for that same process and :317 omits the field when unobservable, so it can never disagree at mint time (:308-317)",
-		};
+	// assertCurrent looks only at OUR generation's directory. Generations are
+	// per-supervisor-instance UUIDs, records are written atomically and mutated
+	// only under a token check, so a valid record with different compared fields
+	// cannot appear there. An external rebuild of the registry from durable
+	// metadata (the #1296 proposal) is what would make this class reachable.
+	if (facts.recordState === "present" && facts.fieldMismatch.length > 0) {
+		return "unreachable-generation-scoped-path";
 	}
-	return {
-		reachability: "reachable",
-		reason:
-			facts.startIdAgreement === "absent-in-record"
-				? "own identity is the running process and the start id is absent exactly as the conditional spread leaves it when getProcessStartId returns undefined (:308-317); the on-disk record is written by other actors and is free"
-				: "own identity is the running process with the start id observed at mint time (:308-317); the on-disk record is written by other actors and is free",
-	};
+	return "reachable";
 }
 
 function factKey(facts: Facts): string {
@@ -230,26 +231,34 @@ interface OwnerRecordOnDisk {
 	updatedAt: string;
 }
 
-interface RivalIdentity {
+interface ProcessIdentityFixture {
 	pid: number;
+	/** The start id the process really had, captured while it was running. */
 	processStartId: string;
 }
 
-interface DeadIdentity {
-	pid: number;
-	/** The start id the process really had, captured before we killed it. */
-	processStartId: string;
-}
+/** A start id no live process can have. Used for the CALLER-side record. */
+const OWN_WRONG_START_ID = "ps:deliberately-not-the-real-start-id";
+/** A different start id no live process can have. Used for the ON-DISK record. */
+const RIVAL_WRONG_START_ID = "ps:rival-deliberately-not-the-real-start-id";
 
-let liveRival: RivalIdentity;
-let deadOwn: DeadIdentity;
+/** A live child process. The on-disk rival in table 1, the live record identity in table 2. */
+let liveRival: ProcessIdentityFixture;
+/** A dead child process, used as the identity OUR side claims. */
+let deadOwn: ProcessIdentityFixture;
+/** A second dead child process, used as the identity the ON-DISK record claims (table 2). */
+let deadRival: ProcessIdentityFixture;
 let ownStartId: string;
-let liveChild: ChildProcess | undefined;
 let previousRegistryDirEnv: string | undefined;
+
+/** Every child this file ever spawned, so the teardown reaps all of them on any path. */
+const spawnedChildren: ChildProcess[] = [];
 
 function spawnIdleChild(): ChildProcess {
 	// A child WE own. Nothing else in this file signals any pid.
-	return spawn(process.execPath, ["-e", "setTimeout(() => {}, 600000)"], { stdio: "ignore" });
+	const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600000)"], { stdio: "ignore" });
+	spawnedChildren.push(child);
+	return child;
 }
 
 function pidIsAlive(pid: number): boolean {
@@ -261,24 +270,70 @@ function pidIsAlive(pid: number): boolean {
 	}
 }
 
+function delay(ms: number): Promise<void> {
+	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+/**
+ * Spawn a child whose real start id differs from every start id already in use.
+ * getProcessStartId is `ps -o lstart=` on macOS (session-lease.ts:158-163),
+ * which has one-second resolution, so two children spawned back to back can
+ * legitimately share a start id. Several cases below need "the record's start
+ * id differs from ours" to be a real difference, so we retry across a second
+ * boundary rather than paper over a collision with a suffix.
+ */
+async function spawnLiveIdentity(
+	taken: Set<string>,
+): Promise<{ child: ChildProcess; identity: ProcessIdentityFixture }> {
+	for (let attempt = 0; attempt < 4; attempt++) {
+		const child = spawnIdleChild();
+		const pid = child.pid;
+		if (pid === undefined) {
+			throw new Error("failed to spawn a child process for the identity fixtures");
+		}
+		const processStartId = getProcessStartId(pid);
+		if (processStartId !== undefined && !taken.has(processStartId)) {
+			return { child, identity: { pid, processStartId } };
+		}
+		// We only ever kill a pid we just created ourselves.
+		child.kill("SIGKILL");
+		await delay(1100);
+	}
+	throw new Error("could not obtain a process start id distinct from the other fixtures");
+}
+
 /**
  * A pid we can prove is dead: we spawn it, capture the start id it really had
  * while it lived (on macOS that value is unobservable once it exits), and kill
  * it. We only ever signal a pid this file created.
  */
-async function createDeadIdentity(): Promise<DeadIdentity> {
-	const child = spawnIdleChild();
-	const pid = child.pid;
-	if (pid === undefined) {
-		throw new Error("failed to spawn the child process used for the dead-pid cases");
-	}
-	const processStartId = getProcessStartId(pid) ?? `ps:dead-${pid}`;
+async function createDeadIdentity(taken: Set<string>): Promise<ProcessIdentityFixture> {
+	const { child, identity } = await spawnLiveIdentity(taken);
 	await new Promise<void>((resolveExit) => {
 		child.once("exit", () => resolveExit());
 		// We only ever kill a pid we just created ourselves.
 		child.kill("SIGKILL");
 	});
-	return { pid, processStartId };
+	return identity;
+}
+
+/**
+ * The real start id of a pid, without shelling out: the only pids this file
+ * ever writes into a record are our own and the three children we spawned, and
+ * their start ids are captured once and proved pairwise distinct in the vacuity
+ * guards. A dead pid has no observable start id.
+ */
+function realStartIdOf(pid: number): string | undefined {
+	if (pid === process.pid) {
+		return ownStartId;
+	}
+	if (pid === liveRival.pid) {
+		return liveRival.processStartId;
+	}
+	if (pid === deadOwn.pid || pid === deadRival.pid) {
+		return undefined;
+	}
+	throw new Error(`a record names a pid this file never created: ${pid}`);
 }
 
 /**
@@ -296,7 +351,7 @@ function ownIdentityFor(facts: Facts): { pid: number; processStartId?: string } 
 				processStartId: facts.pidLiveness === "alive" ? ownStartId : deadOwn.processStartId,
 			};
 		case "mismatches":
-			return { pid, processStartId: "ps:deliberately-not-the-real-start-id" };
+			return { pid, processStartId: OWN_WRONG_START_ID };
 		case "absent-in-record":
 			return { pid };
 	}
@@ -335,9 +390,8 @@ interface CaseResult {
 	facts: Facts;
 	key: string;
 	oracle: Verdict;
-	observed: Observed;
 	reachability: Reachability;
-	reachabilityReason: string;
+	observed: Observed;
 	error?: { name: string; code: unknown };
 }
 
@@ -461,25 +515,22 @@ function writeFileSideState(fixture: OwnSideFixture, facts: Facts): void {
 
 async function runFileSideCase(fixture: OwnSideFixture, facts: Facts): Promise<CaseResult> {
 	writeFileSideState(fixture, facts);
-	const { reachability, reason } = reachabilityOf(facts);
 	try {
 		await fixture.ownership.assertCurrent();
 		return {
 			facts,
 			key: factKey(facts),
 			oracle: decide(facts),
+			reachability: reachability(facts),
 			observed: "recoverable",
-			reachability,
-			reachabilityReason: reason,
 		};
 	} catch (error) {
 		return {
 			facts,
 			key: factKey(facts),
 			oracle: decide(facts),
+			reachability: reachability(facts),
 			observed: "fatal",
-			reachability,
-			reachabilityReason: reason,
 			error: {
 				name: error instanceof Error ? error.name : typeof error,
 				code: (error as { code?: unknown }).code,
@@ -529,13 +580,18 @@ let elapsedMs = 0;
 
 beforeAll(async () => {
 	previousRegistryDirEnv = process.env[REGISTRY_DIR_ENV];
-	ownStartId = getProcessStartId(process.pid) ?? "ps:self";
-	liveChild = spawnIdleChild();
-	if (liveChild.pid === undefined) {
-		throw new Error("failed to spawn the live rival child process");
+	const observedOwnStartId = getProcessStartId(process.pid);
+	if (observedOwnStartId === undefined) {
+		throw new Error("cannot observe this process's own start id; the start-id axes would be vacuous");
 	}
-	liveRival = { pid: liveChild.pid, processStartId: getProcessStartId(liveChild.pid) ?? `ps:rival-${liveChild.pid}` };
-	deadOwn = await createDeadIdentity();
+	ownStartId = observedOwnStartId;
+	// Pairwise-distinct start ids; see spawnLiveIdentity.
+	const taken = new Set<string>([ownStartId, OWN_WRONG_START_ID, RIVAL_WRONG_START_ID]);
+	liveRival = (await spawnLiveIdentity(taken)).identity;
+	taken.add(liveRival.processStartId);
+	deadOwn = await createDeadIdentity(taken);
+	taken.add(deadOwn.processStartId);
+	deadRival = await createDeadIdentity(taken);
 
 	const started = Date.now();
 	const passes: CaseResult[][] = [];
@@ -547,8 +603,14 @@ beforeAll(async () => {
 	secondPass = passes[1] ?? [];
 }, 600_000);
 
+// Runs even when beforeAll throws, which is why every child is tracked at spawn
+// time rather than reaped by whoever created it.
 afterAll(() => {
-	liveChild?.kill("SIGKILL");
+	for (const child of spawnedChildren) {
+		// Only pids this file spawned, held as ChildProcess handles: no pkill, no
+		// kill by name, no pid this file did not create.
+		child.kill("SIGKILL");
+	}
 	if (previousRegistryDirEnv === undefined) {
 		delete process.env[REGISTRY_DIR_ENV];
 	} else {
@@ -560,8 +622,19 @@ describe("daemon supervisor ownership decision table (#1291, #1148)", () => {
 	it("VACUITY GUARD: the fixtures really are what the axes claim", () => {
 		expect(pidIsAlive(liveRival.pid)).toBe(true);
 		expect(liveRival.pid).not.toBe(process.pid);
-		expect(pidIsAlive(deadOwn.pid)).toBe(false);
-		expect(deadOwn.pid).not.toBe(process.pid);
+		expect(getProcessStartId(liveRival.pid)).toBe(liveRival.processStartId);
+		// Both dead identities are proved dead by a pid + process-start probe.
+		for (const dead of [deadOwn, deadRival]) {
+			expect(pidIsAlive(dead.pid)).toBe(false);
+			expect(getProcessStartId(dead.pid)).toBeUndefined();
+			expect(dead.pid).not.toBe(process.pid);
+			expect(dead.pid).not.toBe(liveRival.pid);
+		}
+		expect(deadOwn.pid).not.toBe(deadRival.pid);
+		const startIds = [ownStartId, liveRival.processStartId, deadOwn.processStartId, deadRival.processStartId];
+		expect(new Set(startIds).size).toBe(startIds.length);
+		expect(startIds).not.toContain(OWN_WRONG_START_ID);
+		expect(startIds).not.toContain(RIVAL_WRONG_START_ID);
 		// 32 subsets for the present record, plus one representative each for the
 		// three states in which no record exists to compare fields against.
 		expect(ENUMERATION.length).toBe((32 + 3) * 2 * 3);
@@ -570,6 +643,18 @@ describe("daemon supervisor ownership decision table (#1291, #1148)", () => {
 		// One real acquire per distinct own-side shape per pass; see the cost
 		// equivalence argument above.
 		expect(acquiresPerformed).toBe(OWN_SIDE_SHAPES.length * REPEATS);
+		// Reachability partitions the space: 2 own-side shapes a real supervisor
+		// can have x (1 intact record + 3 record-destruction causes) = 8 reachable;
+		// those same 2 shapes x 31 non-empty mismatch subsets = 62 unreachable at a
+		// generation-scoped path; the remaining 4 own-side shapes x 35 = 140 are
+		// unreachable because acquire mints the identity from process.pid.
+		const byReach = new Map<Reachability, number>();
+		for (const facts of ENUMERATION) {
+			byReach.set(reachability(facts), (byReach.get(reachability(facts)) ?? 0) + 1);
+		}
+		expect(byReach.get("reachable")).toBe(8);
+		expect(byReach.get("unreachable-generation-scoped-path")).toBe(62);
+		expect(byReach.get("unreachable-own-identity-minted")).toBe(140);
 	});
 
 	it("CONFLATION REPORT: the implementation maps oracle-distinct facts onto the same outcome", () => {
@@ -595,32 +680,29 @@ describe("daemon supervisor ownership decision table (#1291, #1148)", () => {
 		}
 		expect(conflatedPairs.length).toBeGreaterThan(0);
 
-		// (c) Compact, deterministically ordered artifact for issue #1291.
-		//
-		// REACHABILITY SPLIT. Divergences are reported in two separate buckets.
-		// Only the "reachable" bucket describes a defect a user can hit: those
-		// shapes have an own-side identity that acquireDaemonSupervisorOwnership
-		// can actually mint (:308-317). The "unreachable-by-construction" bucket
-		// is retained for completeness of the fact space and to pin the fact that
-		// the guarantee comes from the construction site, not from assertCurrent.
+		// (c) Compact, deterministically ordered artifact for issue #1291. Every
+		// line is derived in ENUMERATION order, so the text is byte-stable.
 		const divergent = firstPass.filter((result) => result.oracle !== result.observed);
-		const reachableDivergent = divergent.filter((result) => result.reachability === "reachable");
-		const unreachableDivergent = divergent.filter((result) => result.reachability !== "reachable");
-		const reachableCases = firstPass.filter((result) => result.reachability === "reachable");
+		const reachOrder: Reachability[] = [
+			"reachable",
+			"unreachable-own-identity-minted",
+			"unreachable-generation-scoped-path",
+		];
+		const divergentBy = (reach: Reachability): CaseResult[] =>
+			divergent.filter((result) => result.reachability === reach);
+		const line = (result: CaseResult): string =>
+			`  oracle=${result.oracle} observed=${result.observed}  ${result.key}${result.error ? `  [${result.error.name}/${String(result.error.code)}]` : ""}`;
 		const lines = [
 			`cases=${firstPass.length} (${REPEATS} independent constructions each) conflated-pairs=${conflatedPairs.length}`,
-			`reachable-cases=${reachableCases.length} unreachable-by-construction-cases=${firstPass.length - reachableCases.length}`,
-			`divergent-cases=${divergent.length} (reachable=${reachableDivergent.length} unreachable-by-construction=${unreachableDivergent.length})`,
-			"REACHABLE divergences (defects: an own-side identity acquire can really mint):",
-			...reachableDivergent.map(
-				(result) =>
-					`  oracle=${result.oracle} observed=${result.observed}  ${result.key}${result.error ? `  [${result.error.name}/${String(result.error.code)}]` : ""}`,
-			),
-			"UNREACHABLE-BY-CONSTRUCTION divergences (NOT defects; harness had to overwrite ownership.record):",
-			...unreachableDivergent.map(
-				(result) =>
-					`  oracle=${result.oracle} observed=${result.observed}  ${result.key}\n    reason: ${result.reachabilityReason}`,
-			),
+			`reachability: ${reachOrder
+				.map((reach) => `${reach}=${firstPass.filter((result) => result.reachability === reach).length}`)
+				.join(" ")}`,
+			`divergent-cases=${divergent.length} (${reachOrder.map((reach) => `${reach}=${divergentBy(reach).length}`).join(" ")})`,
+			"REACHABLE divergences - the defect this file is evidence for:",
+			...divergentBy("reachable").map(line),
+			"UNREACHABLE divergences - harness-constructed, NOT evidence of a defect:",
+			`  unreachable-own-identity-minted: ${divergentBy("unreachable-own-identity-minted").length} cases; assertCurrent's own record is minted from process.pid (:309, :316), so a dead or start-id-mismatched own identity cannot occur in production.`,
+			`  unreachable-generation-scoped-path: ${divergentBy("unreachable-generation-scoped-path").length} cases; generations are per-instance UUIDs and records are written atomically under a token check, so a valid record with different compared fields cannot appear at our own path today. The #1296 registry rebuild would make this class reachable.`,
 			"collapsed-causes (all three yield the identical observed outcome under a live owner):",
 			...(["absent", "unparseable", "wrong-shape"] as const).map((state) => {
 				const sample = firstPass.find(
@@ -629,63 +711,31 @@ describe("daemon supervisor ownership decision table (#1291, #1148)", () => {
 						result.facts.pidLiveness === "alive" &&
 						result.facts.startIdAgreement === "matches",
 				);
-				return `  ${state} -> observed=${sample?.observed ?? "n/a"} error=${sample?.error?.name ?? "none"}/${String(sample?.error?.code ?? "none")}`;
+				return `  ${state} -> observed=${sample?.observed ?? "n/a"} error=${sample?.error?.name ?? "none"}/${String(sample?.error?.code ?? "none")} reachability=${sample ? reachability(sample.facts) : "n/a"}`;
 			}),
 		];
 		console.log(lines.join("\n"));
 		expect(divergent.length).toBeGreaterThan(0);
-
-		// The reachable defect set is exactly: record destroyed (absent),
-		// corrupt (unparseable) or not an owner record (wrong-shape) while the
-		// owner process is healthy. Nothing else in the reachable half diverges.
-		expect(
-			reachableDivergent.map((result) => `${result.facts.recordState}/${result.oracle}->${result.observed}`).sort(),
-		).toEqual([
-			"absent/recoverable->fatal",
-			"absent/recoverable->fatal",
-			"unparseable/recoverable->fatal",
-			"unparseable/recoverable->fatal",
-			"wrong-shape/recoverable->fatal",
-			"wrong-shape/recoverable->fatal",
-		]);
-	});
-
-	it("REACHABILITY: the unreachable half is documented, not silently dropped", () => {
-		// Every shape carries a reachability classification with a reason citing
-		// the mint site. Nothing is filtered out of the enumeration.
-		expect(firstPass).toHaveLength(ENUMERATION.length);
-		for (const result of firstPass) {
-			expect(result.reachabilityReason).toContain(":308-317");
-		}
-		const unreachable = firstPass.filter((result) => result.reachability !== "reachable");
-		// 4 of the 6 own-side shapes are unmintable: both dead-pid shapes across
-		// all three start-id agreements (3), plus alive/mismatches (1) - that is
-		// 4 of 6 own-side shapes over 35 file-side states.
-		expect(unreachable).toHaveLength(4 * 35);
-		expect(firstPass.length - unreachable.length).toBe(2 * 35);
-		const unreachableDivergent = unreachable.filter((result) => result.oracle !== result.observed);
-		// These are the four "oracle=fatal observed=recoverable" rows that a naive
-		// reading would report as defects. They exist only because the harness
-		// assigned over ownership.record.pid / .processStartId after acquire.
-		expect(unreachableDivergent.map((result) => result.key).sort()).toEqual([
-			"record=present mismatch=none pid=alive startId=mismatches",
-			"record=present mismatch=none pid=dead startId=absent-in-record",
-			"record=present mismatch=none pid=dead startId=matches",
-			"record=present mismatch=none pid=dead startId=mismatches",
-		]);
-		for (const result of unreachableDivergent) {
-			expect(result.oracle).toBe("fatal");
-			expect(result.observed).toBe("recoverable");
+		// The reachable divergences are exactly the three record-destruction
+		// causes under each of the two own-side shapes a real supervisor can have.
+		expect(divergentBy("reachable")).toHaveLength(6);
+		for (const result of divergentBy("reachable")) {
+			expect(result.facts.recordState).not.toBe("present");
+			expect(result.oracle).toBe("recoverable");
+			expect(result.observed).toBe("fatal");
 		}
 	});
 
-	// EXECUTABLE SPECIFICATION OF THE FIX. Fails on current main because
-	// assertCurrent distinguishes neither readOwnerRecord's three causes of
-	// `undefined` nor a destroyed record from a genuine takeover. Scoped to the
-	// REACHABLE half deliberately: the unreachable half cannot be a defect
-	// because acquireDaemonSupervisorOwnership (:308-317, :362) makes the own
-	// identity vacuously live. Flips to green exactly when the class is fixed.
-	// Never delete this test.
+	// EXECUTABLE SPECIFICATION OF THE FIX, scoped to the REACHABLE fact-shapes.
+	// Fails on current main because assertCurrent treats a destroyed, truncated
+	// or invalid record identically to a lost claim, without consulting the
+	// liveness machinery in the same file. Flips to green exactly when the class
+	// is fixed. Never delete this test.
+	//
+	// Deliberately not asserted over the unreachable shapes: demanding a verdict
+	// there would demand code for states acquireDaemonSupervisorOwnership cannot
+	// produce (own identity is minted from process.pid at :309/:316) and states
+	// no in-repo writer can create at our generation-scoped path.
 	it.fails("SPEC: assertCurrent must agree with the oracle for every REACHABLE fact-shape", () => {
 		const reachable = firstPass.filter((result) => result.reachability === "reachable");
 		expect(reachable.length).toBeGreaterThan(0);
@@ -700,11 +750,628 @@ describe("daemon supervisor ownership decision table (#1291, #1148)", () => {
 		}
 	});
 
+	it("the unreachable divergences stay enumerated and stay labelled", () => {
+		// Kept executable so the reclassification cannot rot: if acquire ever
+		// stops minting its own identity, or a generation stops being unique per
+		// instance, these counts move and this test says so.
+		const divergent = firstPass.filter((result) => result.oracle !== result.observed);
+		expect(divergent.filter((result) => result.reachability === "unreachable-own-identity-minted")).toHaveLength(
+			4,
+		);
+		expect(
+			divergent.filter((result) => result.reachability === "unreachable-generation-scoped-path"),
+		).toHaveLength(0);
+		// Every unreachable-own-identity case is one this harness manufactured by
+		// assigning ownership.record.pid / processStartId after acquire.
+		for (const result of firstPass.filter(
+			(result) => result.reachability === "unreachable-own-identity-minted",
+		)) {
+			expect(result.facts.pidLiveness === "dead" || result.facts.startIdAgreement === "mismatches").toBe(true);
+		}
+	});
 
 	it("REPORT: enumeration size and runtime", () => {
 		console.log(
 			`enumerated fact-shapes=${ENUMERATION.length}; constructions=${ENUMERATION.length * REPEATS}; real acquires=${acquiresPerformed}; construction+assert runtime=${elapsedMs}ms`,
 		);
 		expect(elapsedMs).toBeGreaterThan(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 5. SECOND TABLE: assertDaemonSupervisorOwnerCurrent (:365-390)
+// ---------------------------------------------------------------------------
+//
+// The table above cannot say anything about RIVAL liveness, because
+// assertCurrent's own record is minted from process.pid and its path is scoped
+// to a generation UUID nobody else writes. The exported
+// assertDaemonSupervisorOwnerCurrent is the function where rival liveness is
+// NOT vacuous: it takes an owner DESCRIPTOR supplied by the caller -
+// daemon-mode.ts:719-732 passes a SupervisorGenerationClaim held in memory and
+// re-checked on a fence timer - so pid/processStartId legitimately belong to
+// another process, and that process can die or have its pid recycled between
+// checks.
+//
+//     const current = readOwnerRecord(ownerDirectoryPath(registryDir, owner.generation));
+//     if (!current || current.pid !== owner.pid || current.processStartId !== owner.processStartId ||
+//         current.socketPath !== normalizeSocketPath(owner.socketPath) || !isProcessAlive(current.pid)) throw LOST;
+//     const fingerprint = ownerRecordFingerprint(current);
+//     if (fingerprint !== validatedFingerprint && !isProcessIdentityAlive(current)) throw LOST;
+//     return fingerprint;
+//
+// It already consults liveness, and it still collapses `!current` (record
+// destroyed, truncated, or invalid) into the same throw as a genuine mismatch.
+// It also lets a previously validated fingerprint skip the identity check
+// entirely, so a recycled pid can be reported as the current owner.
+
+const FENCE_FIELDS = ["pid", "processStartId", "socketPath"] as const;
+type FenceField = (typeof FENCE_FIELDS)[number];
+
+/** Liveness of the identity the ON-DISK record names - the fifth axis, made real. */
+type RivalLiveness = "alive" | "dead-pid" | "startid-mismatch" | "no-rival";
+/** Liveness of the identity the CALLER supplied in the owner descriptor. */
+type DescriptorLiveness = "alive" | "dead-pid" | "startid-mismatch";
+/** The two physical components of the record identity, enumerated independently. */
+type RecordPid = "alive" | "dead";
+type RecordStartId = "real" | "wrong" | "absent";
+/** The validatedFingerprint argument, which gates the isProcessIdentityAlive check. */
+type FingerprintArgument = "matches-current" | "stale" | "not-supplied";
+
+interface FenceFacts {
+	readonly recordState: RecordState;
+	/** Always empty unless recordState === "present". */
+	readonly fieldMismatch: readonly FenceField[];
+	/** Representative values only when no record exists; see enumerateFenceFacts. */
+	readonly recordPid: RecordPid;
+	readonly recordStartId: RecordStartId;
+	readonly descriptorLiveness: DescriptorLiveness;
+	readonly fingerprint: FingerprintArgument;
+}
+
+/** "current" is a success outcome: the descriptor still names the live owner. */
+type FenceVerdict = "current" | "recoverable" | "recoverable-by-takeover" | "fatal";
+type FenceObserved = "current" | "fatal";
+
+/**
+ * The rival liveness the record instantiates, judged the way
+ * isProcessIdentityAlive (:521-530) judges it: dead pid, or live pid whose
+ * observed start id contradicts the recorded one, or alive.
+ */
+function rivalLivenessOf(facts: FenceFacts): RivalLiveness {
+	if (facts.recordState !== "present") {
+		return "no-rival";
+	}
+	if (facts.recordPid === "dead") {
+		return "dead-pid";
+	}
+	return facts.recordStartId === "wrong" ? "startid-mismatch" : "alive";
+}
+
+function fenceKey(facts: FenceFacts): string {
+	const mismatch = facts.fieldMismatch.length === 0 ? "none" : facts.fieldMismatch.join("+");
+	const record =
+		facts.recordState === "present" ? `${facts.recordPid}/${facts.recordStartId}` : "n/a";
+	return `record=${facts.recordState} mismatch=${mismatch} rival=${rivalLivenessOf(facts)} recordIdentity=${record} descriptor=${facts.descriptorLiveness} fingerprint=${facts.fingerprint}`;
+}
+
+/**
+ * Which descriptor livenesses are constructible for a given (mismatch, record
+ * identity) point. The descriptor identity is (owner.pid, owner.processStartId)
+ * and the function requires it to equal the record's on both fields unless we
+ * are deliberately perturbing them, so the mismatch subset decides how much of
+ * the descriptor identity we are free to choose. Each branch is an equivalence
+ * argument, not sampling.
+ */
+function constructibleDescriptorLivenesses(
+	recordState: RecordState,
+	fieldMismatch: readonly FenceField[],
+	recordPid: RecordPid,
+	recordStartId: RecordStartId,
+): DescriptorLiveness[] {
+	if (recordState !== "present") {
+		// No record to agree or disagree with: the descriptor identity is entirely
+		// ours to choose, and all three states matter to the oracle.
+		return ["alive", "dead-pid", "startid-mismatch"];
+	}
+	const perturbsPid = fieldMismatch.includes("pid");
+	const perturbsStartId = fieldMismatch.includes("processStartId");
+	if (perturbsPid && perturbsStartId) {
+		return ["alive", "dead-pid", "startid-mismatch"];
+	}
+	if (perturbsPid) {
+		// The descriptor must carry the RECORD's start id on a different pid. A
+		// start id belonging to one process is never the real start id of another,
+		// so a live descriptor pid is necessarily start-id mismatched - unless the
+		// record carries no start id, in which case there is nothing to contradict
+		// and "startid-mismatch" is the unconstructible one instead.
+		return recordStartId === "absent" ? ["alive", "dead-pid"] : ["dead-pid", "startid-mismatch"];
+	}
+	if (perturbsStartId) {
+		// Same pid as the record, different start id.
+		if (recordPid === "dead") {
+			return ["dead-pid"];
+		}
+		// A live pid: the descriptor can carry that pid's REAL start id (alive) or
+		// another wrong one, except when the record already carries the real one -
+		// then "different from the record" forces a wrong value.
+		return recordStartId === "real" ? ["startid-mismatch"] : ["alive", "startid-mismatch"];
+	}
+	// Identity fields equal: the descriptor IS the record identity.
+	const rival = rivalLivenessOf({
+		recordState,
+		fieldMismatch,
+		recordPid,
+		recordStartId,
+		descriptorLiveness: "alive",
+		fingerprint: "not-supplied",
+	});
+	return rival === "no-rival" ? ["alive"] : [rival];
+}
+
+/**
+ * Full cross-product, deterministically ordered, with two documented collapses.
+ *
+ * 1. fieldMismatch and the record identity axes are properties of a record that
+ *    exists. For absent/unparseable/wrong-shape, readOwnerRecord returns
+ *    undefined before any comparison happens, so all subsets and all record
+ *    identities are one physical state: one representative each.
+ * 2. descriptorLiveness is collapsed wherever the mismatch subset forces it;
+ *    see constructibleDescriptorLivenesses.
+ *
+ * The fingerprint argument is caller-supplied and therefore free everywhere,
+ * including the record-less states, so it is enumerated in full.
+ */
+function enumerateFenceFacts(): FenceFacts[] {
+	const recordStates: RecordState[] = ["present", "absent", "unparseable", "wrong-shape"];
+	const fingerprints: FingerprintArgument[] = ["matches-current", "stale", "not-supplied"];
+	const subsets: FenceField[][] = [];
+	for (let mask = 0; mask < 1 << FENCE_FIELDS.length; mask++) {
+		subsets.push(FENCE_FIELDS.filter((_, index) => (mask & (1 << index)) !== 0));
+	}
+	const facts: FenceFacts[] = [];
+	for (const recordState of recordStates) {
+		const mismatches = recordState === "present" ? subsets : [[]];
+		const recordPids: RecordPid[] = recordState === "present" ? ["alive", "dead"] : ["alive"];
+		const recordStartIds: RecordStartId[] = recordState === "present" ? ["real", "wrong", "absent"] : ["real"];
+		for (const fieldMismatch of mismatches) {
+			for (const recordPid of recordPids) {
+				for (const recordStartId of recordStartIds) {
+					for (const descriptorLiveness of constructibleDescriptorLivenesses(
+						recordState,
+						fieldMismatch,
+						recordPid,
+						recordStartId,
+					)) {
+						for (const fingerprint of fingerprints) {
+							facts.push({
+								recordState,
+								fieldMismatch,
+								recordPid,
+								recordStartId,
+								descriptorLiveness,
+								fingerprint,
+							});
+						}
+					}
+				}
+			}
+		}
+	}
+	return facts;
+}
+
+/**
+ * THE ORACLE for assertDaemonSupervisorOwnerCurrent. Total over the fact space.
+ *
+ * validatedFingerprint is deliberately NOT consulted. It is an input the caller
+ * supplies, not a fact about who owns the socket now, and a fingerprint
+ * validated at some earlier instant cannot prove the recorded process is still
+ * the process at that pid. Where today's implementation lets it skip the
+ * identity check, this oracle disagrees on purpose.
+ */
+function fenceDecide(facts: FenceFacts): FenceVerdict {
+	// RULE 4, dominant: the identity supplied from outside is dead or recycled.
+	// An untrusted descriptor may neither hold nor seize anything.
+	if (facts.descriptorLiveness !== "alive") {
+		return "fatal";
+	}
+	// RULE 1: the record is gone, corrupt, or not an owner record, while the
+	// descriptor identity is alive. The entry was destroyed under a live owner -
+	// the #1291 shape, one level up. Recoverable: rewrite the entry.
+	if (facts.recordState !== "present") {
+		return "recoverable";
+	}
+	// RULE 2: the record is present and agrees with the descriptor on all three
+	// compared fields. The descriptor is alive, so the record identity is alive:
+	// the ordinary success path, and the only outcome that should return.
+	if (facts.fieldMismatch.length === 0) {
+		return "current";
+	}
+	// RULE 3: the record names a genuinely live other identity. Stand down.
+	if (rivalLivenessOf(facts) === "alive") {
+		return "fatal";
+	}
+	// RULE 5: the record names an identity that is provably not alive. Nothing
+	// owns that entry; the socket is stranded and a live legitimate holder
+	// should be able to seize it under the guard rule 4 just enforced.
+	return "recoverable-by-takeover";
+}
+
+/**
+ * REACHABILITY for this table. The descriptor is caller-supplied data about
+ * ANOTHER process - a claim held in memory and re-checked on a timer - so a
+ * dead or recycled descriptor identity, a dead or recycled record identity, a
+ * destroyed record and every fingerprint state are all ordinary production
+ * facts. The one class that no in-repo writer produces is the same one as in
+ * table 1: a VALID record with DIFFERENT compared fields at a generation-scoped
+ * path, which the #1296 registry rebuild would create.
+ */
+type FenceReachability = "reachable" | "unreachable-generation-scoped-path";
+
+function fenceReachability(facts: FenceFacts): FenceReachability {
+	return facts.recordState === "present" && facts.fieldMismatch.length > 0
+		? "unreachable-generation-scoped-path"
+		: "reachable";
+}
+
+interface FenceCaseResult {
+	facts: FenceFacts;
+	key: string;
+	oracle: FenceVerdict;
+	reachability: FenceReachability;
+	observed: FenceObserved;
+	error?: { name: string; code: unknown };
+}
+
+interface FenceFixture {
+	root: string;
+	registryDir: string;
+	generation: string;
+	ownerRecordPath: string;
+	baseline: OwnerRecordOnDisk;
+}
+
+/** A fingerprint that is not any record's: used for the "stale" argument. */
+const STALE_FINGERPRINT = createHash("sha256").update("not-the-fingerprint-of-any-record").digest("hex");
+
+function recordIdentityFor(facts: FenceFacts): { pid: number; processStartId?: string } {
+	const pid = facts.recordPid === "alive" ? liveRival.pid : deadRival.pid;
+	switch (facts.recordStartId) {
+		case "real":
+			// The start id that pid really had. For the dead fixture we captured it
+			// while it lived; it is still "the record's own" start id.
+			return { pid, processStartId: facts.recordPid === "alive" ? liveRival.processStartId : deadRival.processStartId };
+		case "wrong":
+			return { pid, processStartId: RIVAL_WRONG_START_ID };
+		case "absent":
+			return { pid };
+	}
+}
+
+function descriptorIdentityFor(
+	facts: FenceFacts,
+	record: { pid: number; processStartId?: string },
+): { pid: number; processStartId?: string } {
+	const perturbsPid = facts.fieldMismatch.includes("pid");
+	const perturbsStartId = facts.fieldMismatch.includes("processStartId");
+	const pid = perturbsPid || facts.recordState !== "present"
+		? facts.descriptorLiveness === "dead-pid"
+			? deadOwn.pid
+			: process.pid
+		: record.pid;
+	if (!perturbsStartId && facts.recordState === "present") {
+		return { pid, processStartId: record.processStartId };
+	}
+	switch (facts.descriptorLiveness) {
+		case "alive":
+			return { pid, processStartId: realStartIdOf(pid) };
+		case "dead-pid":
+		case "startid-mismatch":
+			return { pid, processStartId: OWN_WRONG_START_ID };
+	}
+}
+
+/**
+ * VACUITY GUARD, per case: the descriptor and the bytes on disk must really
+ * instantiate the facts they claim, on both the mismatch subset and the two
+ * liveness axes.
+ */
+function assertFenceCaseIsWhatItClaims(
+	facts: FenceFacts,
+	record: OwnerRecordOnDisk,
+	descriptor: { pid: number; processStartId?: string; socketPath: string },
+): void {
+	if (facts.recordState === "present") {
+		for (const field of FENCE_FIELDS) {
+			const differs = record[field] !== descriptor[field];
+			if (differs !== facts.fieldMismatch.includes(field)) {
+				throw new Error(`constructed case does not match its mismatch subset on ${field}: ${fenceKey(facts)}`);
+			}
+		}
+		const recordAlive = pidIsAlive(record.pid);
+		const recordReal = realStartIdOf(record.pid);
+		const rival = rivalLivenessOf(facts);
+		const rivalHolds =
+			rival === "dead-pid"
+				? !recordAlive
+				: rival === "alive"
+					? recordAlive && (record.processStartId === undefined || record.processStartId === recordReal)
+					: recordAlive && record.processStartId !== undefined && record.processStartId !== recordReal;
+		if (!rivalHolds) {
+			throw new Error(`on-disk rival is not ${rival}: ${fenceKey(facts)}`);
+		}
+	}
+	const descriptorAlive = pidIsAlive(descriptor.pid);
+	const descriptorReal = realStartIdOf(descriptor.pid);
+	const holds =
+		facts.descriptorLiveness === "dead-pid"
+			? !descriptorAlive
+			: facts.descriptorLiveness === "alive"
+				? descriptorAlive && (descriptor.processStartId === undefined || descriptor.processStartId === descriptorReal)
+				: descriptorAlive && descriptor.processStartId !== undefined && descriptor.processStartId !== descriptorReal;
+	if (!holds) {
+		throw new Error(`descriptor identity is not ${facts.descriptorLiveness}: ${fenceKey(facts)}`);
+	}
+}
+
+async function runFenceCase(fixture: FenceFixture, facts: FenceFacts): Promise<FenceCaseResult> {
+	// HARD SAFETY: the function under test resolves its registry from the
+	// environment, so refuse to run unless the environment points inside this
+	// case's own temporary tree.
+	const activeRegistry = process.env[REGISTRY_DIR_ENV];
+	if (activeRegistry !== fixture.registryDir) {
+		throw new Error("refusing to run: the supervisor registry environment does not point at this fixture");
+	}
+	const identity = recordIdentityFor(facts);
+	const record: OwnerRecordOnDisk = {
+		...fixture.baseline,
+		pid: identity.pid,
+		processStartId: identity.processStartId,
+	};
+	switch (facts.recordState) {
+		case "present":
+			writeFileSync(fixture.ownerRecordPath, JSON.stringify(record), { mode: 0o600 });
+			break;
+		case "absent":
+			rmSync(fixture.ownerRecordPath, { force: true });
+			break;
+		case "unparseable":
+			writeFileSync(fixture.ownerRecordPath, '{"version":1,"role":"super', { mode: 0o600 });
+			break;
+		case "wrong-shape":
+			writeFileSync(fixture.ownerRecordPath, JSON.stringify({ ...record, role: "worker" }), { mode: 0o600 });
+			break;
+	}
+	const descriptorIdentity = descriptorIdentityFor(facts, identity);
+	const descriptor = {
+		generation: fixture.generation,
+		pid: descriptorIdentity.pid,
+		...(descriptorIdentity.processStartId ? { processStartId: descriptorIdentity.processStartId } : {}),
+		socketPath: facts.fieldMismatch.includes("socketPath")
+			? `${fixture.baseline.socketPath}.descriptor`
+			: fixture.baseline.socketPath,
+	};
+	assertFenceCaseIsWhatItClaims(facts, record, { ...descriptorIdentity, socketPath: descriptor.socketPath });
+	// The fingerprint the implementation would compute for exactly these bytes.
+	const currentFingerprint =
+		facts.recordState === "present"
+			? createHash("sha256").update(JSON.stringify(JSON.parse(readFileSync(fixture.ownerRecordPath, "utf8")))).digest("hex")
+			: undefined;
+	const validatedFingerprint =
+		facts.fingerprint === "not-supplied"
+			? undefined
+			: facts.fingerprint === "stale"
+				? STALE_FINGERPRINT
+				: (currentFingerprint ?? STALE_FINGERPRINT);
+	if (facts.fingerprint === "stale" && currentFingerprint === STALE_FINGERPRINT) {
+		throw new Error("the stale fingerprint collided with a real one");
+	}
+	const common = {
+		facts,
+		key: fenceKey(facts),
+		oracle: fenceDecide(facts),
+		reachability: fenceReachability(facts),
+	};
+	try {
+		const returned = await assertDaemonSupervisorOwnerCurrent(descriptor, validatedFingerprint);
+		if (currentFingerprint !== undefined && returned !== currentFingerprint) {
+			// Proves our fingerprint computation is the implementation's, not a guess.
+			throw new Error(`fingerprint mismatch between harness and implementation: ${fenceKey(facts)}`);
+		}
+		return { ...common, observed: "current" };
+	} catch (error) {
+		if (!(error instanceof Error) || error.name !== "DaemonSupervisorOwnershipLostError") {
+			throw error;
+		}
+		return {
+			...common,
+			observed: "fatal",
+			error: { name: error.name, code: (error as { code?: unknown }).code },
+		};
+	}
+}
+
+const FENCE_ENUMERATION = enumerateFenceFacts();
+
+let fenceFirstPass: FenceCaseResult[] = [];
+let fenceSecondPass: FenceCaseResult[] = [];
+let fenceElapsedMs = 0;
+let fencePreviousEnv: string | undefined;
+let fenceFixture: FenceFixture | undefined;
+
+describe("assertDaemonSupervisorOwnerCurrent rival-liveness decision table (#1291, #1296)", () => {
+	beforeAll(async () => {
+		fencePreviousEnv = process.env[REGISTRY_DIR_ENV];
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-1291-fence-"));
+		const registryDir = resolve(root, "supervisor-owners");
+		const descriptorDir = resolve(root, "descriptors");
+		const agentDir = resolve(root, "agent");
+		mkdirSync(registryDir, { recursive: true, mode: 0o700 });
+		mkdirSync(descriptorDir, { recursive: true, mode: 0o700 });
+		mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+		process.env[REGISTRY_DIR_ENV] = registryDir;
+		const generation = "gen-fence-0";
+		// One real acquire, purely to obtain a genuine owner record to rewrite.
+		// The function under test takes its owner from the CALLER, so no ownership
+		// object is needed here.
+		const ownership = await acquireDaemonSupervisorOwnership({
+			socketPath: resolve(root, "daemon.sock"),
+			descriptorDir,
+			agentDir,
+			generation,
+			appVersion: "test",
+			registryDir,
+		});
+		acquiresPerformed++;
+		const ownerRecordPath = resolve(registryDir, `${generation}.owner`, "owner.json");
+		const baseline = JSON.parse(readFileSync(ownerRecordPath, "utf8")) as OwnerRecordOnDisk;
+		expect(ownership.record.generation).toBe(generation);
+		fenceFixture = { root, registryDir, generation, ownerRecordPath, baseline };
+
+		const started = Date.now();
+		const passes: FenceCaseResult[][] = [];
+		for (let pass = 0; pass < REPEATS; pass++) {
+			const results: FenceCaseResult[] = [];
+			for (const facts of FENCE_ENUMERATION) {
+				results.push(await runFenceCase(fenceFixture, facts));
+			}
+			passes.push(results);
+		}
+		fenceElapsedMs = Date.now() - started;
+		fenceFirstPass = passes[0] ?? [];
+		fenceSecondPass = passes[1] ?? [];
+	}, 600_000);
+
+	afterAll(() => {
+		if (fenceFixture) {
+			rmSync(fenceFixture.root, { recursive: true, force: true });
+		}
+		if (fencePreviousEnv === undefined) {
+			delete process.env[REGISTRY_DIR_ENV];
+		} else {
+			process.env[REGISTRY_DIR_ENV] = fencePreviousEnv;
+		}
+	});
+
+	it("VACUITY GUARD: the enumeration is total and every axis is exercised", () => {
+		expect(new Set(FENCE_ENUMERATION.map(fenceKey)).size).toBe(FENCE_ENUMERATION.length);
+		expect(fenceFirstPass).toHaveLength(FENCE_ENUMERATION.length);
+		expect(fenceSecondPass).toHaveLength(FENCE_ENUMERATION.length);
+		const rivalCounts = new Map<RivalLiveness, number>();
+		for (const facts of FENCE_ENUMERATION) {
+			const rival = rivalLivenessOf(facts);
+			rivalCounts.set(rival, (rivalCounts.get(rival) ?? 0) + 1);
+		}
+		// All three rival states, and the record-less representative, are present.
+		for (const rival of ["alive", "dead-pid", "startid-mismatch", "no-rival"] as const) {
+			expect(rivalCounts.get(rival) ?? 0).toBeGreaterThan(0);
+		}
+		// The dead rival really is dead and the start-id-mismatched rival really
+		// is a live pid carrying a start id that is not its own.
+		expect(pidIsAlive(deadRival.pid)).toBe(false);
+		expect(getProcessStartId(deadRival.pid)).toBeUndefined();
+		expect(pidIsAlive(liveRival.pid)).toBe(true);
+		expect(getProcessStartId(liveRival.pid)).toBe(liveRival.processStartId);
+		expect(RIVAL_WRONG_START_ID).not.toBe(liveRival.processStartId);
+	});
+
+	it("CONFLATION REPORT: rival liveness is observable here, and still not observed", () => {
+		const nondeterministic = fenceFirstPass
+			.map((first, index) => ({ first, second: fenceSecondPass[index] }))
+			.filter(({ first, second }) => second === undefined || first.observed !== second.observed)
+			.map(({ first }) => first.key);
+		expect(nondeterministic).toEqual([]);
+
+		const oracleOrder: FenceVerdict[] = ["current", "recoverable", "recoverable-by-takeover", "fatal"];
+		const observedOrder: FenceObserved[] = ["current", "fatal"];
+		const divergent = fenceFirstPass.filter((result) => (result.oracle as string) !== (result.observed as string));
+		const reachableDivergent = divergent.filter((result) => result.reachability === "reachable");
+		const unreachableDivergent = divergent.filter((result) => result.reachability !== "reachable");
+		const groupCount = (results: FenceCaseResult[], oracle: FenceVerdict, observed: FenceObserved): number =>
+			results.filter((result) => result.oracle === oracle && result.observed === observed).length;
+		const lines = [
+			`cases=${fenceFirstPass.length} (${REPEATS} independent constructions each)`,
+			`oracle-outcomes: ${oracleOrder
+				.map((verdict) => `${verdict}=${fenceFirstPass.filter((result) => result.oracle === verdict).length}`)
+				.join(" ")}`,
+			`observed-outcomes: ${observedOrder
+				.map((observed) => `${observed}=${fenceFirstPass.filter((result) => result.observed === observed).length}`)
+				.join(" ")} (the function has two outcomes, so recoverable and recoverable-by-takeover are unobservable by construction)`,
+			`divergent-cases=${divergent.length} (reachable=${reachableDivergent.length} unreachable-generation-scoped-path=${unreachableDivergent.length})`,
+			"REACHABLE divergences by outcome pair:",
+			...oracleOrder.flatMap((oracle) =>
+				observedOrder
+					.map((observed) => ({ oracle, observed, count: groupCount(reachableDivergent, oracle, observed) }))
+					.filter((group) => group.count > 0)
+					.map((group) => `  oracle=${group.oracle} observed=${group.observed}: ${group.count}`),
+			),
+			"UNREACHABLE divergences by outcome pair (a valid record with different compared fields at a generation-scoped path; the #1296 rebuild creates exactly this):",
+			...oracleOrder.flatMap((oracle) =>
+				observedOrder
+					.map((observed) => ({ oracle, observed, count: groupCount(unreachableDivergent, oracle, observed) }))
+					.filter((group) => group.count > 0)
+					.map((group) => `  oracle=${group.oracle} observed=${group.observed}: ${group.count}`),
+			),
+			"rival-liveness slice (record present, at least one compared field differs, descriptor alive):",
+			...(["alive", "dead-pid", "startid-mismatch"] as const).map((rival) => {
+				const slice = fenceFirstPass.filter(
+					(result) =>
+						result.facts.recordState === "present" &&
+						result.facts.fieldMismatch.length > 0 &&
+						result.facts.descriptorLiveness === "alive" &&
+						rivalLivenessOf(result.facts) === rival,
+				);
+				return `  rival=${rival} cases=${slice.length} oracle={${[...new Set(slice.map((result) => result.oracle))].sort().join(",")}} observed={${[...new Set(slice.map((result) => result.observed))].sort().join(",")}}`;
+			}),
+			"record-destruction collapse (descriptor alive, record present-and-equal vs destroyed):",
+			...(["present", "absent", "unparseable", "wrong-shape"] as const).map((state) => {
+				const sample = fenceFirstPass.find(
+					(result) =>
+						result.facts.recordState === state &&
+						result.facts.fieldMismatch.length === 0 &&
+						result.facts.descriptorLiveness === "alive" &&
+						result.facts.fingerprint === "not-supplied" &&
+						result.facts.recordPid === "alive" &&
+						result.facts.recordStartId === "real",
+				);
+				return `  ${state} -> oracle=${sample?.oracle ?? "n/a"} observed=${sample?.observed ?? "n/a"} error=${sample?.error?.name ?? "none"}/${String(sample?.error?.code ?? "none")}`;
+			}),
+			"fingerprint bypass (record present and equal, rival pid recycled so its start id no longer matches):",
+			...(["matches-current", "stale", "not-supplied"] as const).map((fingerprint) => {
+				const sample = fenceFirstPass.find(
+					(result) =>
+						result.facts.recordState === "present" &&
+						result.facts.fieldMismatch.length === 0 &&
+						result.facts.recordPid === "alive" &&
+						result.facts.recordStartId === "wrong" &&
+						result.facts.fingerprint === fingerprint,
+				);
+				return `  fingerprint=${fingerprint} -> oracle=${sample?.oracle ?? "n/a"} observed=${sample?.observed ?? "n/a"}`;
+			}),
+		];
+		console.log(lines.join("\n"));
+		expect(divergent.length).toBeGreaterThan(0);
+	});
+
+	// EXECUTABLE SPECIFICATION for the reachable half of this table.
+	it.fails("SPEC: assertDaemonSupervisorOwnerCurrent must agree with the oracle for every REACHABLE fact-shape", () => {
+		const reachable = fenceFirstPass.filter((result) => result.reachability === "reachable");
+		expect(reachable.length).toBeGreaterThan(0);
+		const first = reachable.find((result) => (result.oracle as string) !== (result.observed as string));
+		expect(
+			first === undefined
+				? ""
+				: `first reachable divergence: expected ${first.oracle}, observed ${first.observed} for ${first.key}`,
+		).toBe("");
+		for (const result of reachable) {
+			expect(`${result.key} -> ${result.observed}`).toBe(`${result.key} -> ${result.oracle}`);
+		}
+	});
+
+	it("REPORT: enumeration size and runtime", () => {
+		console.log(
+			`fence fact-shapes=${FENCE_ENUMERATION.length}; constructions=${FENCE_ENUMERATION.length * REPEATS}; construction+assert runtime=${fenceElapsedMs}ms`,
+		);
+		expect(fenceElapsedMs).toBeGreaterThan(0);
 	});
 });
