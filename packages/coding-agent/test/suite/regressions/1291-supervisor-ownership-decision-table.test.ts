@@ -67,6 +67,52 @@ interface Facts {
 
 type Verdict = "recoverable" | "fatal";
 
+/**
+ * Can this fact-shape occur in the shipped product, or only in a harness?
+ *
+ * `DaemonSupervisorOwnership` is constructed in exactly ONE place -
+ * daemon-supervisor-ownership.ts:362, at the end of
+ * acquireDaemonSupervisorOwnership - and that function mints the record in the
+ * CURRENT process: `pid: process.pid` (:316) and
+ * `processStartId: getProcessStartId(process.pid)` (:309), spread conditionally
+ * at :317 so the field is OMITTED when the start id is unobservable. Its only
+ * caller is daemon-supervisor.ts:892.
+ *
+ * Therefore, for assertCurrent, the OWN side of the fact space is not free:
+ * the process executing assertCurrent is by construction the process named in
+ * `this.record`. Its own liveness is vacuously true, and its own start id
+ * either equals the one observed for that pid at mint time or is absent.
+ * The harness can only reach `pidLiveness="dead"` or
+ * `startIdAgreement="mismatches"` by assigning over `ownership.record` after
+ * the fact, which no production path does.
+ *
+ * The FILE side is fully free in production: the bytes at owner.json are
+ * written by other processes, by a reaper, or by a torn write.
+ */
+type Reachability = "reachable" | "unreachable-by-construction";
+
+function reachabilityOf(facts: Facts): { reachability: Reachability; reason: string } {
+	if (facts.pidLiveness === "dead") {
+		return {
+			reachability: "unreachable-by-construction",
+			reason: "own pid is dead, but daemon-supervisor-ownership.ts:316 mints pid=process.pid and :362 is the sole construction site, so the process running assertCurrent IS the recorded pid (:308-317)",
+		};
+	}
+	if (facts.startIdAgreement === "mismatches") {
+		return {
+			reachability: "unreachable-by-construction",
+			reason: "own processStartId contradicts the live process, but :309 records getProcessStartId(process.pid) for that same process and :317 omits the field when unobservable, so it can never disagree at mint time (:308-317)",
+		};
+	}
+	return {
+		reachability: "reachable",
+		reason:
+			facts.startIdAgreement === "absent-in-record"
+				? "own identity is the running process and the start id is absent exactly as the conditional spread leaves it when getProcessStartId returns undefined (:308-317); the on-disk record is written by other actors and is free"
+				: "own identity is the running process with the start id observed at mint time (:308-317); the on-disk record is written by other actors and is free",
+	};
+}
+
 function factKey(facts: Facts): string {
 	const mismatch = facts.fieldMismatch.length === 0 ? "none" : facts.fieldMismatch.join("+");
 	return `record=${facts.recordState} mismatch=${mismatch} pid=${facts.pidLiveness} startId=${facts.startIdAgreement}`;
@@ -290,6 +336,8 @@ interface CaseResult {
 	key: string;
 	oracle: Verdict;
 	observed: Observed;
+	reachability: Reachability;
+	reachabilityReason: string;
 	error?: { name: string; code: unknown };
 }
 
@@ -413,15 +461,25 @@ function writeFileSideState(fixture: OwnSideFixture, facts: Facts): void {
 
 async function runFileSideCase(fixture: OwnSideFixture, facts: Facts): Promise<CaseResult> {
 	writeFileSideState(fixture, facts);
+	const { reachability, reason } = reachabilityOf(facts);
 	try {
 		await fixture.ownership.assertCurrent();
-		return { facts, key: factKey(facts), oracle: decide(facts), observed: "recoverable" };
+		return {
+			facts,
+			key: factKey(facts),
+			oracle: decide(facts),
+			observed: "recoverable",
+			reachability,
+			reachabilityReason: reason,
+		};
 	} catch (error) {
 		return {
 			facts,
 			key: factKey(facts),
 			oracle: decide(facts),
 			observed: "fatal",
+			reachability,
+			reachabilityReason: reason,
 			error: {
 				name: error instanceof Error ? error.name : typeof error,
 				code: (error as { code?: unknown }).code,
@@ -538,13 +596,30 @@ describe("daemon supervisor ownership decision table (#1291, #1148)", () => {
 		expect(conflatedPairs.length).toBeGreaterThan(0);
 
 		// (c) Compact, deterministically ordered artifact for issue #1291.
+		//
+		// REACHABILITY SPLIT. Divergences are reported in two separate buckets.
+		// Only the "reachable" bucket describes a defect a user can hit: those
+		// shapes have an own-side identity that acquireDaemonSupervisorOwnership
+		// can actually mint (:308-317). The "unreachable-by-construction" bucket
+		// is retained for completeness of the fact space and to pin the fact that
+		// the guarantee comes from the construction site, not from assertCurrent.
 		const divergent = firstPass.filter((result) => result.oracle !== result.observed);
+		const reachableDivergent = divergent.filter((result) => result.reachability === "reachable");
+		const unreachableDivergent = divergent.filter((result) => result.reachability !== "reachable");
+		const reachableCases = firstPass.filter((result) => result.reachability === "reachable");
 		const lines = [
 			`cases=${firstPass.length} (${REPEATS} independent constructions each) conflated-pairs=${conflatedPairs.length}`,
-			`divergent-cases=${divergent.length}`,
-			...divergent.map(
+			`reachable-cases=${reachableCases.length} unreachable-by-construction-cases=${firstPass.length - reachableCases.length}`,
+			`divergent-cases=${divergent.length} (reachable=${reachableDivergent.length} unreachable-by-construction=${unreachableDivergent.length})`,
+			"REACHABLE divergences (defects: an own-side identity acquire can really mint):",
+			...reachableDivergent.map(
 				(result) =>
 					`  oracle=${result.oracle} observed=${result.observed}  ${result.key}${result.error ? `  [${result.error.name}/${String(result.error.code)}]` : ""}`,
+			),
+			"UNREACHABLE-BY-CONSTRUCTION divergences (NOT defects; harness had to overwrite ownership.record):",
+			...unreachableDivergent.map(
+				(result) =>
+					`  oracle=${result.oracle} observed=${result.observed}  ${result.key}\n    reason: ${result.reachabilityReason}`,
 			),
 			"collapsed-causes (all three yield the identical observed outcome under a live owner):",
 			...(["absent", "unparseable", "wrong-shape"] as const).map((state) => {
@@ -559,23 +634,72 @@ describe("daemon supervisor ownership decision table (#1291, #1148)", () => {
 		];
 		console.log(lines.join("\n"));
 		expect(divergent.length).toBeGreaterThan(0);
+
+		// The reachable defect set is exactly: record destroyed (absent),
+		// corrupt (unparseable) or not an owner record (wrong-shape) while the
+		// owner process is healthy. Nothing else in the reachable half diverges.
+		expect(
+			reachableDivergent.map((result) => `${result.facts.recordState}/${result.oracle}->${result.observed}`).sort(),
+		).toEqual([
+			"absent/recoverable->fatal",
+			"absent/recoverable->fatal",
+			"unparseable/recoverable->fatal",
+			"unparseable/recoverable->fatal",
+			"wrong-shape/recoverable->fatal",
+			"wrong-shape/recoverable->fatal",
+		]);
+	});
+
+	it("REACHABILITY: the unreachable half is documented, not silently dropped", () => {
+		// Every shape carries a reachability classification with a reason citing
+		// the mint site. Nothing is filtered out of the enumeration.
+		expect(firstPass).toHaveLength(ENUMERATION.length);
+		for (const result of firstPass) {
+			expect(result.reachabilityReason).toContain(":308-317");
+		}
+		const unreachable = firstPass.filter((result) => result.reachability !== "reachable");
+		// 4 of the 6 own-side shapes are unmintable: both dead-pid shapes across
+		// all three start-id agreements (3), plus alive/mismatches (1) - that is
+		// 4 of 6 own-side shapes over 35 file-side states.
+		expect(unreachable).toHaveLength(4 * 35);
+		expect(firstPass.length - unreachable.length).toBe(2 * 35);
+		const unreachableDivergent = unreachable.filter((result) => result.oracle !== result.observed);
+		// These are the four "oracle=fatal observed=recoverable" rows that a naive
+		// reading would report as defects. They exist only because the harness
+		// assigned over ownership.record.pid / .processStartId after acquire.
+		expect(unreachableDivergent.map((result) => result.key).sort()).toEqual([
+			"record=present mismatch=none pid=alive startId=mismatches",
+			"record=present mismatch=none pid=dead startId=absent-in-record",
+			"record=present mismatch=none pid=dead startId=matches",
+			"record=present mismatch=none pid=dead startId=mismatches",
+		]);
+		for (const result of unreachableDivergent) {
+			expect(result.oracle).toBe("fatal");
+			expect(result.observed).toBe("recoverable");
+		}
 	});
 
 	// EXECUTABLE SPECIFICATION OF THE FIX. Fails on current main because
-	// assertCurrent consults neither readOwnerRecord's cause nor the liveness of
-	// the identity it claims. Flips to green exactly when the class is fixed.
+	// assertCurrent distinguishes neither readOwnerRecord's three causes of
+	// `undefined` nor a destroyed record from a genuine takeover. Scoped to the
+	// REACHABLE half deliberately: the unreachable half cannot be a defect
+	// because acquireDaemonSupervisorOwnership (:308-317, :362) makes the own
+	// identity vacuously live. Flips to green exactly when the class is fixed.
 	// Never delete this test.
-	it.fails("SPEC: assertCurrent must agree with the oracle for every enumerated fact-shape", () => {
-		const first = firstPass.find((result) => result.oracle !== result.observed);
+	it.fails("SPEC: assertCurrent must agree with the oracle for every REACHABLE fact-shape", () => {
+		const reachable = firstPass.filter((result) => result.reachability === "reachable");
+		expect(reachable.length).toBeGreaterThan(0);
+		const first = reachable.find((result) => result.oracle !== result.observed);
 		expect(
 			first === undefined
 				? ""
-				: `first divergence: expected ${first.oracle}, observed ${first.observed} for ${first.key}`,
+				: `first reachable divergence: expected ${first.oracle}, observed ${first.observed} for ${first.key}`,
 		).toBe("");
-		for (const result of firstPass) {
+		for (const result of reachable) {
 			expect(`${result.key} -> ${result.observed}`).toBe(`${result.key} -> ${result.oracle}`);
 		}
 	});
+
 
 	it("REPORT: enumeration size and runtime", () => {
 		console.log(
