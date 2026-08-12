@@ -755,17 +755,13 @@ describe("daemon supervisor ownership decision table (#1291, #1148)", () => {
 		// stops minting its own identity, or a generation stops being unique per
 		// instance, these counts move and this test says so.
 		const divergent = firstPass.filter((result) => result.oracle !== result.observed);
-		expect(divergent.filter((result) => result.reachability === "unreachable-own-identity-minted")).toHaveLength(
-			4,
+		expect(divergent.filter((result) => result.reachability === "unreachable-own-identity-minted")).toHaveLength(4);
+		expect(divergent.filter((result) => result.reachability === "unreachable-generation-scoped-path")).toHaveLength(
+			0,
 		);
-		expect(
-			divergent.filter((result) => result.reachability === "unreachable-generation-scoped-path"),
-		).toHaveLength(0);
 		// Every unreachable-own-identity case is one this harness manufactured by
 		// assigning ownership.record.pid / processStartId after acquire.
-		for (const result of firstPass.filter(
-			(result) => result.reachability === "unreachable-own-identity-minted",
-		)) {
+		for (const result of firstPass.filter((result) => result.reachability === "unreachable-own-identity-minted")) {
 			expect(result.facts.pidLiveness === "dead" || result.facts.startIdAgreement === "mismatches").toBe(true);
 		}
 	});
@@ -849,8 +845,7 @@ function rivalLivenessOf(facts: FenceFacts): RivalLiveness {
 
 function fenceKey(facts: FenceFacts): string {
 	const mismatch = facts.fieldMismatch.length === 0 ? "none" : facts.fieldMismatch.join("+");
-	const record =
-		facts.recordState === "present" ? `${facts.recordPid}/${facts.recordStartId}` : "n/a";
+	const record = facts.recordState === "present" ? `${facts.recordPid}/${facts.recordStartId}` : "n/a";
 	return `record=${facts.recordState} mismatch=${mismatch} rival=${rivalLivenessOf(facts)} recordIdentity=${record} descriptor=${facts.descriptorLiveness} fingerprint=${facts.fingerprint}`;
 }
 
@@ -1040,7 +1035,10 @@ function recordIdentityFor(facts: FenceFacts): { pid: number; processStartId?: s
 		case "real":
 			// The start id that pid really had. For the dead fixture we captured it
 			// while it lived; it is still "the record's own" start id.
-			return { pid, processStartId: facts.recordPid === "alive" ? liveRival.processStartId : deadRival.processStartId };
+			return {
+				pid,
+				processStartId: facts.recordPid === "alive" ? liveRival.processStartId : deadRival.processStartId,
+			};
 		case "wrong":
 			return { pid, processStartId: RIVAL_WRONG_START_ID };
 		case "absent":
@@ -1054,11 +1052,12 @@ function descriptorIdentityFor(
 ): { pid: number; processStartId?: string } {
 	const perturbsPid = facts.fieldMismatch.includes("pid");
 	const perturbsStartId = facts.fieldMismatch.includes("processStartId");
-	const pid = perturbsPid || facts.recordState !== "present"
-		? facts.descriptorLiveness === "dead-pid"
-			? deadOwn.pid
-			: process.pid
-		: record.pid;
+	const pid =
+		perturbsPid || facts.recordState !== "present"
+			? facts.descriptorLiveness === "dead-pid"
+				? deadOwn.pid
+				: process.pid
+			: record.pid;
 	if (!perturbsStartId && facts.recordState === "present") {
 		return { pid, processStartId: record.processStartId };
 	}
@@ -1107,8 +1106,11 @@ function assertFenceCaseIsWhatItClaims(
 		facts.descriptorLiveness === "dead-pid"
 			? !descriptorAlive
 			: facts.descriptorLiveness === "alive"
-				? descriptorAlive && (descriptor.processStartId === undefined || descriptor.processStartId === descriptorReal)
-				: descriptorAlive && descriptor.processStartId !== undefined && descriptor.processStartId !== descriptorReal;
+				? descriptorAlive &&
+					(descriptor.processStartId === undefined || descriptor.processStartId === descriptorReal)
+				: descriptorAlive &&
+					descriptor.processStartId !== undefined &&
+					descriptor.processStartId !== descriptorReal;
 	if (!holds) {
 		throw new Error(`descriptor identity is not ${facts.descriptorLiveness}: ${fenceKey(facts)}`);
 	}
@@ -1155,7 +1157,9 @@ async function runFenceCase(fixture: FenceFixture, facts: FenceFacts): Promise<F
 	// The fingerprint the implementation would compute for exactly these bytes.
 	const currentFingerprint =
 		facts.recordState === "present"
-			? createHash("sha256").update(JSON.stringify(JSON.parse(readFileSync(fixture.ownerRecordPath, "utf8")))).digest("hex")
+			? createHash("sha256")
+					.update(JSON.stringify(JSON.parse(readFileSync(fixture.ownerRecordPath, "utf8"))))
+					.digest("hex")
 			: undefined;
 	const validatedFingerprint =
 		facts.fingerprint === "not-supplied"
@@ -1296,7 +1300,9 @@ describe("assertDaemonSupervisorOwnerCurrent rival-liveness decision table (#129
 				.join(" ")}`,
 			`observed-outcomes: ${observedOrder
 				.map((observed) => `${observed}=${fenceFirstPass.filter((result) => result.observed === observed).length}`)
-				.join(" ")} (the function has two outcomes, so recoverable and recoverable-by-takeover are unobservable by construction)`,
+				.join(
+					" ",
+				)} (the function has two outcomes, so recoverable and recoverable-by-takeover are unobservable by construction)`,
 			`divergent-cases=${divergent.length} (reachable=${reachableDivergent.length} unreachable-generation-scoped-path=${unreachableDivergent.length})`,
 			"REACHABLE divergences by outcome pair:",
 			...oracleOrder.flatMap((oracle) =>
