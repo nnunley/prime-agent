@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -90,28 +90,70 @@ interface Facts {
 type Verdict = "recoverable" | "fatal";
 
 /**
- * Whether a fact-shape can occur in production, or exists only because the
- * harness manufactured it. Enumeration is unaffected; the report splits on it.
+ * Can this fact-shape occur in the shipped product, or only in a harness?
+ *
+ * TWO INDEPENDENT ARGUMENTS, one per side of the fact space.
+ *
+ * OWN SIDE. `DaemonSupervisorOwnership` is constructed in exactly one place -
+ * :362, at the end of acquireDaemonSupervisorOwnership - and that function
+ * mints the record in the CURRENT process: `pid: process.pid` (:316) and
+ * `processStartId: getProcessStartId(process.pid)` (:309), spread conditionally
+ * at :317 so the field is OMITTED when the start id is unobservable. Its only
+ * caller is daemon-supervisor.ts:892. The process executing assertCurrent is
+ * therefore by construction the process named in `this.record`: its liveness is
+ * vacuously true and its start id either matches the one observed at mint time
+ * or is absent. The harness reaches pidLiveness="dead" and
+ * startIdAgreement="mismatches" only by assigning over `ownership.record`.
+ *
+ * FILE SIDE. The bytes at owner.json are free in production - a reaper, an
+ * external tool or a crash can remove or corrupt them, which is #1291 itself.
+ * But a VALID record carrying DIFFERENT compared fields at OUR path is not
+ * free: assertCurrent reads ownerDirectoryPath(registryDir,
+ * this.record.generation) (:602-607), generations are per-instance UUIDs
+ * (daemon-supervisor.ts:605), records are written atomically
+ * (writeJsonAtomically, :710-712) and mutated only under a token+generation
+ * check (:291-299). No in-repo writer can produce that state; a registry
+ * rebuilt from durable metadata (the #1296 proposal) is what would.
+ *
+ * The own-side argument partitions 210 into 70 mintable and 140 unmintable
+ * shapes. The file-side argument splits those 70 further: 8 that can occur
+ * today and 62 that need an out-of-repo writer.
  */
 type Reachability = "reachable" | "unreachable-own-identity-minted" | "unreachable-generation-scoped-path";
 
-function reachability(facts: Facts): Reachability {
-	// acquireDaemonSupervisorOwnership sets pid: process.pid (:316) and
-	// processStartId: getProcessStartId(process.pid) (:309), and nothing in the
-	// repo rewrites them afterwards. The process running assertCurrent is
-	// therefore alive with a matching (or unobservable) start id, always.
-	if (facts.pidLiveness === "dead" || facts.startIdAgreement === "mismatches") {
-		return "unreachable-own-identity-minted";
+function reachabilityOf(facts: Facts): { reachability: Reachability; reason: string } {
+	if (facts.pidLiveness === "dead") {
+		return {
+			reachability: "unreachable-own-identity-minted",
+			reason:
+				"own pid is dead, but :316 mints pid=process.pid and :362 is the sole construction site, so the process running assertCurrent IS the recorded pid (:308-317)",
+		};
 	}
-	// assertCurrent looks only at OUR generation's directory. Generations are
-	// per-supervisor-instance UUIDs, records are written atomically and mutated
-	// only under a token check, so a valid record with different compared fields
-	// cannot appear there. An external rebuild of the registry from durable
-	// metadata (the #1296 proposal) is what would make this class reachable.
+	if (facts.startIdAgreement === "mismatches") {
+		return {
+			reachability: "unreachable-own-identity-minted",
+			reason:
+				"own processStartId contradicts the live process, but :309 records getProcessStartId(process.pid) for that same process and :317 omits the field when unobservable, so it can never disagree at mint time (:308-317)",
+		};
+	}
 	if (facts.recordState === "present" && facts.fieldMismatch.length > 0) {
-		return "unreachable-generation-scoped-path";
+		return {
+			reachability: "unreachable-generation-scoped-path",
+			reason:
+				"own identity is mintable (:308-317), but a valid record with different compared fields cannot appear at this generation's directory: generations are per-instance UUIDs (daemon-supervisor.ts:605), writes are atomic (:710-712) and mutations are token-checked (:291-299); the #1296 registry rebuild would create this class",
+		};
 	}
-	return "reachable";
+	return {
+		reachability: "reachable",
+		reason:
+			facts.startIdAgreement === "absent-in-record"
+				? "own identity is the running process and the start id is absent exactly as the conditional spread leaves it when getProcessStartId returns undefined (:308-317); the on-disk record is written by other actors and is free"
+				: "own identity is the running process with the start id observed at mint time (:308-317); the on-disk record is written by other actors and is free",
+	};
+}
+
+function reachability(facts: Facts): Reachability {
+	return reachabilityOf(facts).reachability;
 }
 
 function factKey(facts: Facts): string {
@@ -391,6 +433,7 @@ interface CaseResult {
 	key: string;
 	oracle: Verdict;
 	reachability: Reachability;
+	reachabilityReason: string;
 	observed: Observed;
 	error?: { name: string; code: unknown };
 }
@@ -515,13 +558,15 @@ function writeFileSideState(fixture: OwnSideFixture, facts: Facts): void {
 
 async function runFileSideCase(fixture: OwnSideFixture, facts: Facts): Promise<CaseResult> {
 	writeFileSideState(fixture, facts);
+	const { reachability: reach, reason } = reachabilityOf(facts);
 	try {
 		await fixture.ownership.assertCurrent();
 		return {
 			facts,
 			key: factKey(facts),
 			oracle: decide(facts),
-			reachability: reachability(facts),
+			reachability: reach,
+			reachabilityReason: reason,
 			observed: "recoverable",
 		};
 	} catch (error) {
@@ -529,7 +574,8 @@ async function runFileSideCase(fixture: OwnSideFixture, facts: Facts): Promise<C
 			facts,
 			key: factKey(facts),
 			oracle: decide(facts),
-			reachability: reachability(facts),
+			reachability: reach,
+			reachabilityReason: reason,
 			observed: "fatal",
 			error: {
 				name: error instanceof Error ? error.name : typeof error,
@@ -700,6 +746,7 @@ describe("daemon supervisor ownership decision table (#1291, #1148)", () => {
 			`divergent-cases=${divergent.length} (${reachOrder.map((reach) => `${reach}=${divergentBy(reach).length}`).join(" ")})`,
 			"REACHABLE divergences - the defect this file is evidence for:",
 			...divergentBy("reachable").map(line),
+			`own-side mintable cases=${firstPass.filter((result) => result.reachability !== "unreachable-own-identity-minted").length} (of which reachable today=${firstPass.filter((result) => result.reachability === "reachable").length}, needing an out-of-repo writer=${firstPass.filter((result) => result.reachability === "unreachable-generation-scoped-path").length})`,
 			"UNREACHABLE divergences - harness-constructed, NOT evidence of a defect:",
 			`  unreachable-own-identity-minted: ${divergentBy("unreachable-own-identity-minted").length} cases; assertCurrent's own record is minted from process.pid (:309, :316), so a dead or start-id-mismatched own identity cannot occur in production.`,
 			`  unreachable-generation-scoped-path: ${divergentBy("unreachable-generation-scoped-path").length} cases; generations are per-instance UUIDs and records are written atomically under a token check, so a valid record with different compared fields cannot appear at our own path today. The #1296 registry rebuild would make this class reachable.`,
@@ -750,20 +797,45 @@ describe("daemon supervisor ownership decision table (#1291, #1148)", () => {
 		}
 	});
 
-	it("the unreachable divergences stay enumerated and stay labelled", () => {
-		// Kept executable so the reclassification cannot rot: if acquire ever
-		// stops minting its own identity, or a generation stops being unique per
-		// instance, these counts move and this test says so.
-		const divergent = firstPass.filter((result) => result.oracle !== result.observed);
-		expect(divergent.filter((result) => result.reachability === "unreachable-own-identity-minted")).toHaveLength(4);
-		expect(divergent.filter((result) => result.reachability === "unreachable-generation-scoped-path")).toHaveLength(
-			0,
-		);
-		// Every unreachable-own-identity case is one this harness manufactured by
-		// assigning ownership.record.pid / processStartId after acquire.
-		for (const result of firstPass.filter((result) => result.reachability === "unreachable-own-identity-minted")) {
-			expect(result.facts.pidLiveness === "dead" || result.facts.startIdAgreement === "mismatches").toBe(true);
+	it("REACHABILITY: the unreachable half is documented, not silently dropped", () => {
+		// Every shape carries a classification with a reason citing the mint site.
+		// Nothing is filtered out of the enumeration.
+		expect(firstPass).toHaveLength(ENUMERATION.length);
+		for (const result of firstPass) {
+			expect(result.reachabilityReason).toContain(":308-317");
 		}
+		// 4 of the 6 own-side shapes are unmintable: both dead-pid shapes across
+		// all three start-id agreements (3), plus alive/mismatches (1) - that is
+		// 4 of 6 own-side shapes over 35 file-side states.
+		const unmintable = firstPass.filter((result) => result.reachability === "unreachable-own-identity-minted");
+		expect(unmintable).toHaveLength(4 * 35);
+		expect(firstPass.length - unmintable.length).toBe(2 * 35);
+		// These are the four "oracle=fatal observed=recoverable" rows that a naive
+		// reading would report as defects. They exist only because the harness
+		// assigned over ownership.record.pid / .processStartId after acquire.
+		const unmintableDivergent = unmintable.filter((result) => result.oracle !== result.observed);
+		expect(unmintableDivergent.map((result) => result.key).sort()).toEqual([
+			"record=present mismatch=none pid=alive startId=mismatches",
+			"record=present mismatch=none pid=dead startId=absent-in-record",
+			"record=present mismatch=none pid=dead startId=matches",
+			"record=present mismatch=none pid=dead startId=mismatches",
+		]);
+		for (const result of unmintableDivergent) {
+			expect(result.oracle).toBe("fatal");
+			expect(result.observed).toBe("recoverable");
+		}
+		// The mintable 70 split further on the file-side argument, and the class
+		// that needs an out-of-repo writer never diverges today: assertCurrent and
+		// the oracle agree that a live rival is fatal.
+		expect(firstPass.filter((result) => result.reachability === "unreachable-generation-scoped-path")).toHaveLength(
+			62,
+		);
+		expect(
+			firstPass.filter(
+				(result) =>
+					result.reachability === "unreachable-generation-scoped-path" && result.oracle !== result.observed,
+			),
+		).toHaveLength(0);
 	});
 
 	it("REPORT: enumeration size and runtime", () => {
@@ -1255,6 +1327,58 @@ describe("assertDaemonSupervisorOwnerCurrent rival-liveness decision table (#129
 		} else {
 			process.env[REGISTRY_DIR_ENV] = fencePreviousEnv;
 		}
+	});
+
+	it("ISOLATION: the registry seam is the environment variable, proved positively and negatively", async () => {
+		// assertDaemonSupervisorOwnerCurrent has no registryDir parameter: it calls
+		// defaultDaemonSupervisorRegistryDir() (:374, :249-251), which reads
+		// PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR and only falls back
+		// to the real socket directory when that is unset. This test proves the
+		// override is what the function actually follows, so no case in this table
+		// can reach the developer's live registry.
+		const fixture = fenceFixture;
+		if (!fixture) {
+			throw new Error("fence fixture was not created");
+		}
+		// Every path this table touches lives under the OS temp dir, in a
+		// directory this test created.
+		expect(fixture.root.startsWith(resolve(tmpdir()))).toBe(true);
+		expect(fixture.registryDir.startsWith(fixture.root)).toBe(true);
+		expect(process.env[REGISTRY_DIR_ENV]).toBe(fixture.registryDir);
+
+		const descriptor = {
+			generation: fixture.generation,
+			pid: liveRival.pid,
+			processStartId: liveRival.processStartId,
+			socketPath: fixture.baseline.socketPath,
+		};
+		const record: OwnerRecordOnDisk = {
+			...fixture.baseline,
+			pid: liveRival.pid,
+			processStartId: liveRival.processStartId,
+		};
+		writeFileSync(fixture.ownerRecordPath, JSON.stringify(record), { mode: 0o600 });
+
+		// POSITIVE: with the variable pointing at our fixture, the function reads
+		// OUR bytes - it returns the fingerprint of the record we just wrote.
+		const expected = createHash("sha256").update(JSON.stringify(record)).digest("hex");
+		await expect(assertDaemonSupervisorOwnerCurrent(descriptor)).resolves.toBe(expected);
+
+		// NEGATIVE: repoint the variable at a different empty registry and the very
+		// same descriptor is reported lost. The function follows the variable; it
+		// never consults the fixture it just read, and never falls back while the
+		// variable is set.
+		const decoy = mkdtempSync(join(tmpdir(), "prime-agent-1291-decoy-"));
+		try {
+			process.env[REGISTRY_DIR_ENV] = decoy;
+			await expect(assertDaemonSupervisorOwnerCurrent(descriptor)).rejects.toThrow(/supervisor|ownership/i);
+			// The decoy is untouched: a read-only lookup created no owner directory.
+			expect(readdirSync(decoy)).toEqual([]);
+		} finally {
+			process.env[REGISTRY_DIR_ENV] = fixture.registryDir;
+			rmSync(decoy, { recursive: true, force: true });
+		}
+		expect(process.env[REGISTRY_DIR_ENV]).toBe(fixture.registryDir);
 	});
 
 	it("VACUITY GUARD: the enumeration is total and every axis is exercised", () => {
