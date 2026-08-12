@@ -55,6 +55,44 @@ const REGISTRY_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 const BOGUS_START_ID = "ps:deliberately-not-the-real-start-id";
 
 /**
+ * PLATFORM PRECONDITION for gap (b).
+ *
+ * Gap (b) needs getProcessStartId(process.pid) to genuinely return undefined.
+ * getProcessStartId reads /proc/<pid>/stat first (session-lease.ts:147-156) and
+ * only falls through to execFileSync("ps", ...) (:158-163) when that read fails,
+ * which is the macOS/BSD path. Emptying PATH therefore hides the start id on
+ * macOS and does nothing on Linux, where /proc/<pid>/stat always succeeds.
+ *
+ * A process cannot make its own /proc/<pid>/stat unreadable: procfs rejects
+ * chmod with EPERM even for the owning uid, hidepid never hides the reader's own
+ * entry, and unmounting or shadowing /proc needs a mount namespace, i.e. root
+ * (measured on Ubuntu 24.04 / kernel 6.8: chmod -> EPERM, `unshare -m` -> EPERM,
+ * apparmor_restrict_unprivileged_userns=1). So on Linux the fixture cannot be
+ * built honestly inside a unit test, and the gap (b) tests skip rather than
+ * assert nothing. Gap (a) has no such dependency and runs everywhere.
+ *
+ * This is detected rather than hardcoded per platform: it directly measures the
+ * precondition the fixture needs.
+ */
+function startIdCanBeHidden(): boolean {
+	const previousPath = process.env.PATH;
+	process.env.PATH = resolve(tmpdir(), "prime-agent-1291-no-such-bin");
+	try {
+		return getProcessStartId(process.pid) === undefined;
+	} finally {
+		if (previousPath === undefined) {
+			delete process.env.PATH;
+		} else {
+			process.env.PATH = previousPath;
+		}
+	}
+}
+
+const CAN_HIDE_START_ID = startIdCanBeHidden();
+/** Reads correctly whether the test ran or was skipped. */
+const GAP_B_PRECONDITION = "requires an unobservable getProcessStartId; skipped where /proc/<pid>/stat resolves it";
+
+/**
  * assertDaemonSupervisorOwnerCurrent takes no registryDir; it calls
  * defaultDaemonSupervisorRegistryDir() itself (:374), which reads this env var
  * and otherwise falls back to the developer's LIVE socket directory. The env var
@@ -143,8 +181,8 @@ async function createIdentityGapFixture(
 
 describe("supervisor recorded-identity gaps (#1291, #1148)", () => {
 	let staleIdentity: IdentityGapFixture;
-	let unfenced: IdentityGapFixture;
-	let unfencedRawRecord: Record<string, unknown>;
+	let unfenced: IdentityGapFixture | undefined;
+	let unfencedRawRecord: Record<string, unknown> | undefined;
 	let startIdWasHonestlyUnobservable = false;
 	let freshStartId: string | undefined;
 	let previousRegistryDirEnv: string | undefined;
@@ -175,10 +213,13 @@ describe("supervisor recorded-identity gaps (#1291, #1148)", () => {
 		);
 		freshStartId = getProcessStartId(process.pid);
 
-		// (b) A record minted while the start id was genuinely unobservable.
-		unfenced = await createIdentityGapFixture(`gen-unfenced-${process.pid}`, { hideStartId: true });
-		unfencedRawRecord = JSON.parse(readFileSync(unfenced.ownerRecordPath, "utf8")) as Record<string, unknown>;
-		startIdWasHonestlyUnobservable = unfenced.ownership.record.processStartId === undefined;
+		// (b) A record minted while the start id was genuinely unobservable. Only
+		// constructible where the ps fallback is the sole source of the start id.
+		if (CAN_HIDE_START_ID) {
+			unfenced = await createIdentityGapFixture(`gen-unfenced-${process.pid}`, { hideStartId: true });
+			unfencedRawRecord = JSON.parse(readFileSync(unfenced.ownerRecordPath, "utf8")) as Record<string, unknown>;
+			startIdWasHonestlyUnobservable = unfenced.ownership.record.processStartId === undefined;
+		}
 	}, 120_000);
 
 	afterAll(() => {
@@ -199,8 +240,10 @@ describe("supervisor recorded-identity gaps (#1291, #1148)", () => {
 	it("VACUITY GUARD: the fixtures really are what the tests claim", () => {
 		// Temp registries only. The developer's live daemon tree is never touched.
 		expect(staleIdentity.registryDir.startsWith(tmpdir())).toBe(true);
-		expect(unfenced.registryDir.startsWith(tmpdir())).toBe(true);
-		expect(staleIdentity.registryDir).not.toBe(unfenced.registryDir);
+		if (unfenced) {
+			expect(unfenced.registryDir.startsWith(tmpdir())).toBe(true);
+			expect(staleIdentity.registryDir).not.toBe(unfenced.registryDir);
+		}
 		// The stand-in holder is a real live process, and it is not us.
 		expect(pidIsAlive(otherHolder.pid)).toBe(true);
 		expect(otherHolder.pid).not.toBe(process.pid);
@@ -231,45 +274,73 @@ describe("supervisor recorded-identity gaps (#1291, #1148)", () => {
 
 	// GAP (b) ----------------------------------------------------------------
 
-	it("an unobservable start id at mint time yields a record with no identity fence", async () => {
-		expect(startIdWasHonestlyUnobservable).toBe(true);
-		expect(unfenced.ownership.record.processStartId).toBeUndefined();
-		// Not merely undefined: the conditional spread at :317 omits the key.
-		expect(Object.hasOwn(unfencedRawRecord, "processStartId")).toBe(false);
-		expect(unfencedRawRecord.pid).toBe(process.pid);
+	// Documents the skip above with the concrete platform fact, so a Linux reader
+	// sees why the fixture is absent instead of an unexplained skip.
+	it.runIf(!CAN_HIDE_START_ID)(
+		"SKIP REASON for gap (b): /proc/<pid>/stat resolves the start id, so it cannot be hidden",
+		() => {
+			expect(getProcessStartId(process.pid)).toMatch(/^proc:/);
+			expect(readFileSync(`/proc/${process.pid}/stat`, "utf8").length).toBeGreaterThan(0);
+			// The Linux start id is field 22 of /proc/<pid>/stat, and it is the same
+			// string the fence compares, so gap (a) above exercises the real format.
+			expect(staleIdentity.ownership.record.processStartId).not.toBe(getProcessStartId(process.pid));
+		},
+	);
 
-		// The fence is now strictly weaker, and the real exported checker shows it.
-		// Point the record at a pid held by a process that never minted it - the
-		// pid-reuse shape - and compare two records that differ ONLY in whether the
-		// start id is recorded.
-		const withoutStartId = { ...unfencedRawRecord, pid: otherHolder.pid } as Record<string, unknown>;
-		const withContradictingStartId = { ...withoutStartId, processStartId: BOGUS_START_ID };
-		const claim = {
-			generation: unfenced.generation,
-			pid: otherHolder.pid,
-			socketPath: unfenced.ownership.record.socketPath,
-		};
+	it.skipIf(!CAN_HIDE_START_ID)(
+		`an unobservable start id at mint time yields a record with no identity fence (${GAP_B_PRECONDITION})`,
+		async () => {
+			const fixture = unfenced;
+			const rawRecord = unfencedRawRecord;
+			if (!fixture || !rawRecord) {
+				throw new Error("gap (b) fixture missing despite the start id being hideable");
+			}
+			expect(startIdWasHonestlyUnobservable).toBe(true);
+			expect(fixture.ownership.record.processStartId).toBeUndefined();
+			// Not merely undefined: the conditional spread at :317 omits the key.
+			expect(Object.hasOwn(rawRecord, "processStartId")).toBe(false);
+			expect(rawRecord.pid).toBe(process.pid);
 
-		writeFileSync(unfenced.ownerRecordPath, JSON.stringify(withContradictingStartId), { mode: 0o600 });
-		await expect(
-			withRegistryEnv(unfenced.registryDir, () =>
-				assertDaemonSupervisorOwnerCurrent({ ...claim, processStartId: BOGUS_START_ID }),
-			),
-		).rejects.toThrow();
+			// The fence is now strictly weaker, and the real exported checker shows it.
+			// Point the record at a pid held by a process that never minted it - the
+			// pid-reuse shape - and compare two records that differ ONLY in whether the
+			// start id is recorded.
+			const withoutStartId = { ...rawRecord, pid: otherHolder.pid } as Record<string, unknown>;
+			const withContradictingStartId = { ...withoutStartId, processStartId: BOGUS_START_ID };
+			const claim = {
+				generation: fixture.generation,
+				pid: otherHolder.pid,
+				socketPath: fixture.ownership.record.socketPath,
+			};
 
-		writeFileSync(unfenced.ownerRecordPath, JSON.stringify(withoutStartId), { mode: 0o600 });
-		await expect(
-			withRegistryEnv(unfenced.registryDir, () => assertDaemonSupervisorOwnerCurrent(claim)),
-		).resolves.toEqual(expect.any(String));
-	});
+			writeFileSync(fixture.ownerRecordPath, JSON.stringify(withContradictingStartId), { mode: 0o600 });
+			await expect(
+				withRegistryEnv(fixture.registryDir, () =>
+					assertDaemonSupervisorOwnerCurrent({ ...claim, processStartId: BOGUS_START_ID }),
+				),
+			).rejects.toThrow();
+
+			writeFileSync(fixture.ownerRecordPath, JSON.stringify(withoutStartId), { mode: 0o600 });
+			await expect(
+				withRegistryEnv(fixture.registryDir, () => assertDaemonSupervisorOwnerCurrent(claim)),
+			).resolves.toEqual(expect.any(String));
+		},
+	);
 
 	// SPEC. acquireDaemonSupervisorOwnership must not mint an owner record with no
 	// identity fence. When getProcessStartId cannot observe the start id, a bare
 	// pid is not a safe fence, because every consumer in this file reads an absent
 	// start id as agreement (:525-527, :536). Fails on current main because :317
 	// simply omits the field. Never delete this test.
-	it.fails("SPEC: acquire must not mint an owner record without a process identity fence", () => {
-		expect(startIdWasHonestlyUnobservable).toBe(true);
-		expect(unfenced.ownership.record.processStartId).toBeDefined();
-	});
+	//
+	// Skipped where the precondition cannot be built: without the skip it would
+	// still be red on Linux, but for the wrong reason - the unbuildable fixture
+	// rather than the missing fence - which is a vacuous it.fails.
+	it.skipIf(!CAN_HIDE_START_ID).fails(
+		`SPEC: acquire must not mint an owner record without a process identity fence (${GAP_B_PRECONDITION})`,
+		() => {
+			expect(startIdWasHonestlyUnobservable).toBe(true);
+			expect(unfenced?.ownership.record.processStartId).toBeDefined();
+		},
+	);
 });
