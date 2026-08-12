@@ -13,18 +13,18 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import type { DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import {
 	createDaemonCommandEnvelope,
 	type DaemonCommand,
 	type DaemonResponse,
-} from "../src/modes/daemon/daemon-protocol.js";
-import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+} from "../../../src/modes/daemon/daemon-protocol.js";
+import { DaemonSupervisor } from "../../../src/modes/daemon/daemon-supervisor.js";
 import {
 	acquireDaemonSupervisorOwnership,
 	assertDaemonSupervisorOwnerCurrent,
-} from "../src/modes/daemon/daemon-supervisor-ownership.js";
-import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
+} from "../../../src/modes/daemon/daemon-supervisor-ownership.js";
+import { MutationDrainLatch } from "../../../src/modes/daemon/mutation-drain-latch.js";
 
 // Dialectical proofs for the owner-record conflation reported in #1291 / #1148.
 //
